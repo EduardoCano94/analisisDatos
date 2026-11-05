@@ -1,0 +1,5 @@
+venv/
+__pycache__/
+data/
+salidas/panel_municipio_mes.csv.gz
+salidas/dataset_modelado.csv.gz
