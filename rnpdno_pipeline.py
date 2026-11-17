@@ -8,7 +8,8 @@ Uso (desde la carpeta del proyecto, con los CSV en ./data):
     python rnpdno_pipeline.py eda        # 3) análisis exploratorio + gráficas
     python rnpdno_pipeline.py model      # 4) variable objetivo, modelos, evaluación
     python rnpdno_pipeline.py mapas      # 5) mapas (opcional, requiere shapefile INEGI en data/geo)
-    python rnpdno_pipeline.py all        # 2 + 3 + 4
+    python rnpdno_pipeline.py validar    # 4b) evaluación repetida (2022-2025)
+    python rnpdno_pipeline.py all        # 2 + 3 + 4 + 4b
 
 IMPORTANTE: no conozco los nombres exactos de columnas de los CSV. El script los
 detecta automáticamente, pero corre primero `inspect` y, si algo sale mal,
@@ -47,6 +48,7 @@ PCT_FOCO = 0.90        # foco = top 10 % de municipios
 FIN_TRAIN = "2022-12"  # la ventana objetivo termina <= esta fecha
 FIN_VAL = "2023-12"    # validación: 2023; prueba: 2024-2025
 SEED = 42
+USAR_LIGHTGBM = False  # True requiere: pip install lightgbm
 
 
 # ----------------------------------------------------------------------------
@@ -121,9 +123,9 @@ def catalogo():
 
 
 def clave_valida(s):
-    """Excluye claves geográficas no resueltas (no 5 dígitos, 000, 999, 99xxx)."""
+    """Excluye claves geográficas no resueltas (no 5 dígitos, 000, 998, 999, 99xxx)."""
     ok = s.str.fullmatch(r"\d{5}")
-    return ok & ~s.str.endswith("000") & ~s.str.endswith("999") & ~s.str.startswith("99") & ~s.str.startswith("00")
+    return ok & ~s.str.endswith("000") & ~s.str.endswith("998") & ~s.str.endswith("999") & ~s.str.startswith("99") & ~s.str.startswith("00")
 
 
 # ----------------------------------------------------------------------------
@@ -309,9 +311,48 @@ def construir_dataset(df):
     return out
 
 
-FEATURES = ["lag1", "lag3", "lag6", "lag12", "media_movil_3", "media_movil_6", "crecimiento_6m",
+FEATURES = ["lag1", "lag3", "lag6", "lag12", "crecimiento_6m",
             "crecimiento_3m", "prop_mujeres_6m", "loc_vida_6m", "loc_sin_vida_6m",
             "meses_con_casos_12m", "tendencia_estatal", "mes_del_anio"]
+
+
+def crear_modelos(pos_w):
+    """Regresión logística, Random Forest y boosting (LightGBM > XGBoost > HistGradientBoosting)."""
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    modelos = {
+        "Regresión logística": make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000, class_weight="balanced")),
+        "Random Forest": RandomForestClassifier(n_estimators=300, min_samples_leaf=5, class_weight="balanced_subsample",
+                                                n_jobs=-1, random_state=SEED),
+    }
+    # Boosting de árboles: HistGradientBoosting de scikit-learn (equivalente a LightGBM, sin dependencias
+    # extra). Para usar LightGBM, pon USAR_LIGHTGBM = True al inicio del script.
+    if USAR_LIGHTGBM:
+        from lightgbm import LGBMClassifier
+        modelos["LightGBM"] = LGBMClassifier(n_estimators=300, learning_rate=0.05, num_leaves=31,
+                                             scale_pos_weight=pos_w, random_state=SEED, verbose=-1)
+    else:
+        from sklearn.ensemble import HistGradientBoostingClassifier
+        modelos["Boosting (HistGradientBoosting)"] = HistGradientBoostingClassifier(
+            class_weight="balanced", random_state=SEED)
+    return modelos
+
+
+def calibrador(s_fit, y_fit):
+    """Calibración isotónica: convierte el puntaje del modelo en la frecuencia realmente observada
+    de focos emergentes. Se ajusta con predicciones fuera de muestra. Devuelve una función."""
+    from sklearn.isotonic import IsotonicRegression
+    iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip").fit(np.asarray(s_fit, float), np.asarray(y_fit))
+    return lambda x: iso.predict(np.asarray(x, float))
+
+
+def tabla_calibracion(y, p, bins=10):
+    """Probabilidad media predicha vs. frecuencia observada por decil de puntaje."""
+    d = pd.DataFrame({"y": np.asarray(y), "p": np.asarray(p)})
+    d["decil"] = pd.qcut(d["p"].rank(method="first"), bins, labels=False) + 1
+    return d.groupby("decil").agg(prob_media=("p", "mean"), frecuencia_observada=("y", "mean"), n=("y", "size")).round(4)
 
 
 def cmd_model():
@@ -325,7 +366,7 @@ def cmd_model():
     OUT_DIR.mkdir(exist_ok=True); FIG_DIR.mkdir(parents=True, exist_ok=True)
     df = load_panel()
     ds = construir_dataset(df)
-    ds.to_csv(OUT_DIR / "dataset_modelado.csv.gz", index=False)
+    ds.to_pickle(OUT_DIR / "dataset_modelado.pkl")
 
     # Solo municipios que NO son foco actualmente, con historial y futuro observable
     base = ds[ds["valida_hist"] & ds["valida_futuro"] & ~ds["foco_actual"]].copy()
@@ -343,24 +384,7 @@ def cmd_model():
     Xte, yte = te[FEATURES], te["y"]
     pos_w = (ytr == 0).sum() / max(ytr.sum(), 1)
 
-    modelos = {
-        "Regresión logística": make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000, class_weight="balanced")),
-        "Random Forest": RandomForestClassifier(n_estimators=300, min_samples_leaf=5, class_weight="balanced_subsample",
-                                                n_jobs=-1, random_state=SEED),
-    }
-    try:
-        from lightgbm import LGBMClassifier
-        modelos["LightGBM"] = LGBMClassifier(n_estimators=300, learning_rate=0.05, num_leaves=31,
-                                             scale_pos_weight=pos_w, random_state=SEED, verbose=-1)
-    except ImportError:
-        try:
-            from xgboost import XGBClassifier
-            modelos["XGBoost"] = XGBClassifier(n_estimators=300, learning_rate=0.05, max_depth=5,
-                                               scale_pos_weight=pos_w, eval_metric="aucpr", random_state=SEED)
-        except ImportError:
-            from sklearn.ensemble import HistGradientBoostingClassifier
-            modelos["HistGradientBoosting"] = HistGradientBoostingClassifier(class_weight="balanced", random_state=SEED)
-            print("Aviso: no hay lightgbm/xgboost; usando HistGradientBoosting. (pip install lightgbm)")
+    modelos = crear_modelos(pos_w)
 
     def mejor_umbral(y, s):
         p, r, t = precision_recall_curve(y, s)
@@ -418,21 +442,92 @@ def cmd_model():
     plt.tight_layout(); plt.savefig(FIG_DIR / "08_importancia.png", dpi=150); plt.close()
     imp.sort_values(ascending=False).to_csv(OUT_DIR / "importancia_variables.csv", header=["importancia"])
 
-    # Reentrenar con train+val y rankear municipios con los datos más recientes
+    # Calibración (isotónica). Comprobación honesta: se ajusta con validación (modelo entrenado
+    # hasta 2022) y se mide en prueba. Brier más bajo = probabilidades más realistas.
+    from sklearn.metrics import brier_score_loss
+    s_va_m = ajustados[nombre].predict_proba(Xva)[:, 1]
+    s_te_m = ajustados[nombre].predict_proba(Xte)[:, 1]
+    p_te_cal = calibrador(s_va_m, yva)(s_te_m)
+    brier = {"Brier prueba, puntaje sin calibrar": brier_score_loss(yte, s_te_m),
+             "Brier prueba, calibrado (isotónica)": brier_score_loss(yte, p_te_cal),
+             "Brier prueba, predecir siempre la prevalencia de entrenamiento": brier_score_loss(yte, np.full(len(yte), ytr.mean()))}
+    pd.Series(brier).round(4).to_csv(OUT_DIR / "calibracion_brier.csv", header=["valor"])
+    tc = tabla_calibracion(yte, p_te_cal)
+    tc.to_csv(OUT_DIR / "calibracion_deciles.csv")
+    print("\nCalibración (prueba):"); print(pd.Series(brier).round(4).to_string()); print(tc.to_string())
+    plt.figure(figsize=(5, 5))
+    plt.plot(tc["prob_media"], tc["frecuencia_observada"], "o-", label="Calibrado (isotónica)")
+    mx = float(max(tc["prob_media"].max(), tc["frecuencia_observada"].max())) * 1.1
+    plt.plot([0, mx], [0, mx], "--", c="gray", label="Calibración perfecta")
+    plt.xlabel("Probabilidad media predicha"); plt.ylabel("Frecuencia observada"); plt.title(f"Calibración en prueba – {nombre}")
+    plt.legend(); plt.grid(alpha=.3); plt.tight_layout(); plt.savefig(FIG_DIR / "11_calibracion.png", dpi=150); plt.close()
+
+    # Reentrenar con train+val; el calibrador se ajusta con las predicciones fuera de muestra
+    # sobre prueba (2024-2025) del modelo reentrenado; luego se puntúa el último mes.
     final = modelos[nombre]
     final.fit(pd.concat([Xtr, Xva]), pd.concat([ytr, yva]))
+    calibrar = calibrador(final.predict_proba(Xte)[:, 1], yte)
     ult = ds[(ds["mes"] == ds["mes"].max()) & ~ds["foco_actual"]].copy()
-    ult["probabilidad"] = final.predict_proba(ult[FEATURES])[:, 1]
+    ult["puntaje"] = final.predict_proba(ult[FEATURES])[:, 1]
+    ult["probabilidad"] = calibrar(ult["puntaje"].values)
     ult = ult.merge(catalogo(), on="clave", how="left")
-    ult[["clave", "estado", "municipio", "probabilidad", "lag6", "crecimiento_6m"]].sort_values(
-        "probabilidad", ascending=False).to_csv(OUT_DIR / "riesgo_todos_municipios.csv", index=False)
-    top = ult.sort_values("probabilidad", ascending=False).head(50)[
-        ["clave", "estado", "municipio", "probabilidad", "lag6", "crecimiento_6m"]]
+    cols = ["clave", "estado", "municipio", "probabilidad", "puntaje", "lag6", "lag12", "crecimiento_6m"]
+    ult[cols].sort_values(["probabilidad", "puntaje"], ascending=False).to_csv(OUT_DIR / "riesgo_todos_municipios.csv", index=False)
+    top = ult.sort_values(["probabilidad", "puntaje"], ascending=False).head(50)[cols]
     top.to_csv(OUT_DIR / "top50_municipios_riesgo.csv", index=False)
-    print("\nTop 10 municipios con mayor probabilidad estimada:")
+    print(f"\nMunicipios puntuados (no-foco en el último mes): {len(ult)}")
+    print("Top 10 municipios por riesgo (probabilidad calibrada de ser foco emergente en 6 meses):")
     print(top.head(10).round(3).to_string(index=False))
     print("\nNota: son estimaciones del modelo, no hechos que necesariamente ocurrirán.")
 
+
+
+# ----------------------------------------------------------------------------
+# 4b) VALIDAR: evaluación repetida con orígenes móviles (años de prueba 2022-2025)
+# ----------------------------------------------------------------------------
+def cmd_validar():
+    from sklearn.metrics import average_precision_score, roc_auc_score
+    OUT_DIR.mkdir(exist_ok=True)
+    ds = construir_dataset(load_panel())
+    base = ds[ds["valida_hist"] & ds["valida_futuro"] & ~ds["foco_actual"]].copy()
+    K = 50  # presupuesto de alertas: los 50 municipios mejor rankeados cada mes
+    filas = []
+    for anio in (2022, 2023, 2024, 2025):
+        tr = base[base["mes_fin"] <= pd.Period(f"{anio - 1}-12", "M")]
+        te = base[base["mes_fin"].dt.year == anio]
+        if tr["y"].sum() == 0 or te["y"].sum() == 0:
+            continue
+        pos_w = (tr["y"] == 0).sum() / max(tr["y"].sum(), 1)
+        modelos = crear_modelos(pos_w)
+        scores = {"Línea base (crecimiento 6m)": te["crecimiento_6m"].values}
+        for nom, mdl in modelos.items():
+            print(f"[{anio}] entrenando {nom} ...")
+            mdl.fit(tr[FEATURES], tr["y"])
+            scores[nom] = mdl.predict_proba(te[FEATURES])[:, 1]
+        for nom, sc in scores.items():
+            d = te[["mes", "y"]].assign(s=sc)
+            pk = d.groupby("mes").apply(lambda g: g.nlargest(K, "s")["y"].mean()).mean()
+            filas.append({"anio_prueba": anio, "modelo": nom, "filas_prueba": len(te),
+                          "prevalencia": te["y"].mean(),
+                          "PR-AUC": average_precision_score(te["y"], sc),
+                          "ROC-AUC": roc_auc_score(te["y"], sc),
+                          f"precision@{K}_por_mes": pk})
+    R = pd.DataFrame(filas)
+    R.round(4).to_csv(OUT_DIR / "validacion_repetida.csv", index=False)
+    res = R.groupby("modelo").agg(PR_AUC_media=("PR-AUC", "mean"), PR_AUC_desv=("PR-AUC", "std"),
+                                  PR_AUC_min=("PR-AUC", "min"), PR_AUC_max=("PR-AUC", "max"),
+                                  prevalencia_media=("prevalencia", "mean"),
+                                  precision_top50_media=(f"precision@{K}_por_mes", "mean")).round(4)
+    res.to_csv(OUT_DIR / "validacion_repetida_resumen.csv")
+    print("\nPR-AUC por año de prueba:")
+    print(R.pivot(index="modelo", columns="anio_prueba", values="PR-AUC").round(3).to_string())
+    print("\nResumen (4 años de prueba):"); print(res.to_string())
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+    pv = R.pivot(index="anio_prueba", columns="modelo", values="PR-AUC")
+    ax = pv.plot(marker="o", figsize=(8, 4.5), title="PR-AUC por año de prueba (origen móvil)")
+    ax.plot(pv.index, R.groupby("anio_prueba")["prevalencia"].first().values, "k--", label="Azar (prevalencia)")
+    ax.set_xticks(list(pv.index)); ax.set_ylabel("PR-AUC"); ax.legend(fontsize=8); ax.grid(alpha=.3)
+    plt.tight_layout(); plt.savefig(FIG_DIR / "12_validacion_repetida.png", dpi=150); plt.close()
 
 # ----------------------------------------------------------------------------
 # 5) MAPAS (requiere geopandas + shapefile municipal del INEGI)
@@ -565,8 +660,8 @@ def cmd_mapas():
         m2 = g.merge(rk, on="clave", how="left")
         ax = m2.plot(column="probabilidad", cmap="viridis", legend=True, figsize=(10, 7), edgecolor="none",
                      missing_kwds={"color": "lightgrey", "label": "Foco actual / sin dato"},
-                     legend_kwds={"label": "Probabilidad estimada (ranking del modelo)", "shrink": .6})
-        ax.set_axis_off(); ax.set_title("Municipios con mayor probabilidad estimada de foco emergente")
+                     legend_kwds={"label": "Probabilidad calibrada estimada (6 meses)", "shrink": .6})
+        ax.set_axis_off(); ax.set_title("Riesgo estimado de convertirse en foco emergente (estimación del modelo)")
         plt.tight_layout(); plt.savefig(FIG_DIR / "10_mapa_riesgo.png", dpi=150); plt.close()
     print("Mapas guardados en", FIG_DIR)
 
@@ -574,7 +669,7 @@ def cmd_mapas():
 # ----------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("paso", choices=["inspect", "prepare", "eda", "model", "mapas", "all"])
+    ap.add_argument("paso", choices=["inspect", "prepare", "eda", "model", "validar", "mapas", "all"])
     a = ap.parse_args()
     if a.paso == "inspect":
         cmd_inspect()
@@ -584,10 +679,12 @@ def main():
         cmd_eda()
     elif a.paso == "model":
         cmd_model()
+    elif a.paso == "validar":
+        cmd_validar()
     elif a.paso == "mapas":
         cmd_mapas()
     else:
-        cmd_prepare(); cmd_eda(); cmd_model()
+        cmd_prepare(); cmd_eda(); cmd_model(); cmd_validar()
 
 
 if __name__ == "__main__":

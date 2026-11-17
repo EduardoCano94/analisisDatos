@@ -1,0 +1,4 @@
+,valor
+"Brier prueba, puntaje sin calibrar",0.2122
+"Brier prueba, calibrado (isotónica)",0.0258
+"Brier prueba, predecir siempre la prevalencia de entrenamiento",0.0285
