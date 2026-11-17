@@ -305,6 +305,7 @@ def construir_dataset(df):
     out["mes_del_anio"] = out["mes"].dt.month
     out["foco_actual"] = foco_pas.values.ravel()
     out["foco_futuro"] = foco_fut.values.ravel()
+    out["umbral_foco"] = np.tile(q_pas.values, n)  # casos en 6 meses que definen "foco" en cada mes
     out["valida_futuro"] = np.tile(np.arange(T) + h < T, n)
     out["valida_hist"] = np.tile(np.arange(T) >= 11, n)
     out["y"] = (out["foco_futuro"] & ~out["foco_actual"]).astype(int)
@@ -314,6 +315,14 @@ def construir_dataset(df):
 FEATURES = ["lag1", "lag3", "lag6", "lag12", "crecimiento_6m",
             "crecimiento_3m", "prop_mujeres_6m", "loc_vida_6m", "loc_sin_vida_6m",
             "meses_con_casos_12m", "tendencia_estatal", "mes_del_anio"]
+
+
+# Líneas base: reglas simples sin aprendizaje. Sirven para saber cuánto aportan realmente los modelos.
+BASELINES = {
+    "Línea base (crecimiento 6m)": lambda X: X["crecimiento_6m"].values,
+    "Línea base (casos 6m)": lambda X: X["lag6"].values,
+    "Línea base (persistencia 12m)": lambda X: (X["meses_con_casos_12m"] + 1e-3 * X["lag12"]).values,
+}
 
 
 def crear_modelos(pos_w):
@@ -374,6 +383,8 @@ def cmd_model():
     tr = base[base["mes_fin"] <= ft]
     va = base[(base["mes_fin"] > ft) & (base["mes_fin"] <= fv)]
     te = base[base["mes_fin"] > fv]
+    print("Umbral de foco (mediana de casos en 6 meses que definen 'foco', por año):")
+    print(ds.groupby(ds["mes"].dt.year)["umbral_foco"].median().to_string())
     print(f"Filas  train={len(tr)}  val={len(va)}  test={len(te)}")
     print(f"Focos emergentes (prevalencia)  train={tr.y.mean():.4f}  val={va.y.mean():.4f}  test={te.y.mean():.4f}")
     if min(tr.y.sum(), va.y.sum(), te.y.sum()) == 0:
@@ -403,9 +414,10 @@ def cmd_model():
                 "F1_test": f1_score(yte, pred)}
 
     res, scores_te, ajustados = [], {}, {}
-    # Línea base: mayor crecimiento reciente
-    res.append(evaluar("Línea base (crecimiento 6m)", Xva["crecimiento_6m"].values, Xte["crecimiento_6m"].values))
-    scores_te["Línea base (crecimiento 6m)"] = Xte["crecimiento_6m"].values
+    # Líneas base (reglas simples)
+    for nb, f in BASELINES.items():
+        res.append(evaluar(nb, f(Xva), f(Xte)))
+        scores_te[nb] = f(Xte)
     for nombre, mdl in modelos.items():
         print(f"Entrenando {nombre} ...")
         mdl.fit(Xtr, ytr)
@@ -482,6 +494,37 @@ def cmd_model():
 
 
 
+def calibracion_rodante(base, anios=(2023, 2024, 2025)):
+    """Evalúa la calibración como se usaría en la práctica: para cada año, el calibrador se ajusta con
+    predicciones fuera de muestra del año anterior (modelo entrenado hasta 2 años antes) y se mide en
+    ese año con un modelo entrenado hasta el año anterior. Modelo: regresión logística."""
+    from sklearn.metrics import brier_score_loss
+    filas, deciles = [], []
+    for anio in anios:
+        P = lambda a: pd.Period(f"{a}-12", "M")
+        tr_a = base[base["mes_fin"] <= P(anio - 2)]
+        cal = base[base["mes_fin"].dt.year == anio - 1]
+        tr_b = base[base["mes_fin"] <= P(anio - 1)]
+        te = base[base["mes_fin"].dt.year == anio]
+        m_a = crear_modelos(1)["Regresión logística"].fit(tr_a[FEATURES], tr_a["y"])
+        f_cal = calibrador(m_a.predict_proba(cal[FEATURES])[:, 1], cal["y"])
+        m_b = crear_modelos(1)["Regresión logística"].fit(tr_b[FEATURES], tr_b["y"])
+        p = f_cal(m_b.predict_proba(te[FEATURES])[:, 1])
+        b_mod = brier_score_loss(te["y"], p)
+        b_ref = brier_score_loss(te["y"], np.full(len(te), tr_b["y"].mean()))
+        filas.append({"anio": anio, "prevalencia": te["y"].mean(), "prob_media_predicha": p.mean(),
+                      "brier_calibrado": b_mod, "brier_prevalencia_train": b_ref,
+                      "skill_brier": 1 - b_mod / b_ref})
+        d = tabla_calibracion(te["y"], p).reset_index()
+        d.insert(0, "anio", anio)
+        deciles.append(d)
+    R = pd.DataFrame(filas).round(4)
+    R.to_csv(OUT_DIR / "calibracion_rodante.csv", index=False)
+    pd.concat(deciles).to_csv(OUT_DIR / "calibracion_rodante_deciles.csv", index=False)
+    print("\nCalibración rodante (calibrador del año anterior, medido en el año):")
+    print(R.to_string(index=False))
+
+
 # ----------------------------------------------------------------------------
 # 4b) VALIDAR: evaluación repetida con orígenes móviles (años de prueba 2022-2025)
 # ----------------------------------------------------------------------------
@@ -499,7 +542,7 @@ def cmd_validar():
             continue
         pos_w = (tr["y"] == 0).sum() / max(tr["y"].sum(), 1)
         modelos = crear_modelos(pos_w)
-        scores = {"Línea base (crecimiento 6m)": te["crecimiento_6m"].values}
+        scores = {nb: f(te) for nb, f in BASELINES.items()}
         for nom, mdl in modelos.items():
             print(f"[{anio}] entrenando {nom} ...")
             mdl.fit(tr[FEATURES], tr["y"])
@@ -528,6 +571,7 @@ def cmd_validar():
     ax.plot(pv.index, R.groupby("anio_prueba")["prevalencia"].first().values, "k--", label="Azar (prevalencia)")
     ax.set_xticks(list(pv.index)); ax.set_ylabel("PR-AUC"); ax.legend(fontsize=8); ax.grid(alpha=.3)
     plt.tight_layout(); plt.savefig(FIG_DIR / "12_validacion_repetida.png", dpi=150); plt.close()
+    calibracion_rodante(base)
 
 # ----------------------------------------------------------------------------
 # 5) MAPAS (requiere geopandas + shapefile municipal del INEGI)

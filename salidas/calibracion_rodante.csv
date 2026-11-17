@@ -1,0 +1,4 @@
+anio,prevalencia,prob_media_predicha,brier_calibrado,brier_prevalencia_train,skill_brier
+2023,0.0311,0.0287,0.025,0.0301,0.1721
+2024,0.029,0.0399,0.0253,0.0282,0.1018
+2025,0.0296,0.0305,0.0242,0.0287,0.1586
